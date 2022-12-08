@@ -1,0 +1,468 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <string.h>
+#include <ctype.h>
+#include <arpa/inet.h>
+#include<errno.h>
+#include<sys/stat.h>
+#include<pthread.h>
+
+
+#define SERVER_POST 80
+
+
+static int debug = 1;
+int get_line(int socket, char* buf, int size);
+void do_http_response1(int client_sock);
+void* do_http_request(void* pclient_sock);
+void do_http_response(int client_sock,const char *path);
+void not_found(int client_sock);//404
+void unimplemented(int client_sock);//500
+int headers(int client_sock, FILE* rescourse);
+void cat(int client_sock, FILE* rescourse);
+void inner_error(int client_sock);
+void bad_request(int client_sock);
+
+perror_exit(const char* des)
+{
+    //fprintf(stderr, "%s error, reason : %s\n",des, strerror(errno));
+    perror(des);
+    exit(1);
+}
+
+
+
+int main(void) {
+
+    int sock;
+    int i, ret;
+    struct sockaddr_in server_addr;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (sock == -1)
+    {
+        perror_exit("create socket");
+    }
+
+    bzero(&server_addr, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(SERVER_POST);
+
+    ret = bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    if (ret == -1)
+    {
+        perror_exit("bind");
+    }
+
+    ret = listen(sock, 128);
+
+    if (ret == -1)
+    {
+        perror_exit("listen");
+    }
+
+    printf("等待客户端的连接：\n");
+
+    int done = 1;
+
+    while (done) {
+        struct sockaddr_in client;
+        int client_sock, len;
+        char client_ip[64];
+        char buf[256];
+        pthread_t id;
+        int* pclient_sock = NULL;
+
+        socklen_t client_addr_len;
+        client_addr_len = sizeof(client);
+        client_sock = accept(sock, (struct sockaddr*)&client, &client_addr_len);
+
+        printf("client ip: %s\t port : %d\n",
+            inet_ntop(AF_INET, &client.sin_addr.s_addr, client_ip, sizeof(client_ip)),
+            ntohs(client.sin_port));
+
+        /*处理http请求，处理客户端发送的数据*/
+        //do_http_request(client_sock);
+
+        pclient_sock = (int*)malloc(sizeof(int));
+        *pclient_sock = client_sock;
+        pthread_create(&id, NULL, do_http_request, (void*)pclient_sock);
+
+        //close(client_sock);
+
+    }
+    close(sock);
+    return 0;
+}
+
+
+void * do_http_request(void* pclient_sock)
+{
+    int len = 0;
+    char buf[256];
+    char method[64];
+    char url[256];
+    char path[256];
+    struct stat st;
+    int client_sock = *(int *)pclient_sock;
+
+    /*读取客户端发送的http请求*/
+
+    //1、读取请求行
+
+     len = get_line(client_sock, buf, sizeof(buf));
+     if (len > 0)//读到了请求行
+     {
+         int i = 0, j = 0;
+         while (!isspace(buf[j]) && (i < sizeof(method) - 1))
+         {
+             method[i] = buf[j];
+             i++;
+             j++;
+         }
+         method[i] = '\0';
+         if(debug) printf("request method : %s\n", method);
+
+
+         if (strncasecmp(method, "GET", i)==0)//只处理get请求
+         {
+             if (debug) printf("method= = GET\n");
+
+             //获取url
+             while (isspace(buf[j++]));//跳过白空格
+             i = 0;
+
+             while (!isspace(buf[j]) && (i < sizeof(url) - 1))
+             {
+                 url[i] = buf[j];
+                 i++;
+                 j++;
+             }
+
+             url[i] = '\0';
+             if (debug) printf("url : %s\n", url);
+
+
+             //继续读取http头部
+             do {
+                 len = get_line(client_sock, buf, sizeof(buf));
+                 if (debug) printf("read : %s\n", buf);
+             } while (len > 0);
+
+             //定位服务器本地的html文件
+
+             //处理url中的？
+             {
+                 char* pos = strchr(url, '?');
+                 if (pos)
+                 {
+                     *pos = '\0';
+                     printf("real url : %s\n", url);
+                 }
+             }
+
+             sprintf(path, "./html_docs/%s", url);
+             if (debug) printf("path : %s\n", path);
+
+             //执行http响应
+             //判断文件是否存在
+             if (stat(path, &st) == -1)//文件不存在或出错
+             {
+                 fprintf(stderr, "stat %s failed reason: %s\n", path, strerror(errno));
+                 not_found(client_sock);
+             }
+             else
+             {
+                 if (S_ISDIR(st.st_mode))
+                 {
+                     strcat(path, "/index.html");
+                 }
+
+                 do_http_response(client_sock,path);
+             }
+
+         }
+         else//非get请求，读取htpp头部，响应就客户端501
+         {
+             fprintf(stderr, "warning! other request [%s]\n", method);
+             do {
+                 len = get_line(client_sock, buf, sizeof(buf));
+                 if (debug) printf("read : %s\n", buf);
+             } while (len > 0);
+
+             unimplemented(client_sock);//请求未实现
+         }
+     }
+     else//请求格式有问题，出错处理
+     {
+         bad_request(client_sock);
+     }
+     close(client_sock);
+     if (pclient_sock) free(pclient_sock);//释放动态分配的内存
+     return NULL;
+}
+
+void  do_http_response(int client_sock, const char *path)
+{
+    int ret = 0;
+    FILE* resourse = NULL;
+    resourse = fopen(path, "r");
+    if (resourse == NULL)
+    {
+        not_found(client_sock);
+        return;
+    }
+
+    //1、发送http头部
+    ret = headers(client_sock, resourse);
+
+    //2、发送http body
+    if (!ret)
+    {
+        cat(client_sock, resourse);
+    }
+
+    fclose(resourse);
+}
+
+
+//成功返回0，失败返回-1
+int headers(int client_sock, FILE* rescourse)
+{
+    struct stat st;
+    int fileid = 0;
+    char tmp[64];
+    char buf[1024] = { 0 };
+    strcpy(buf, "HTTP/1.0 200 OK\r\n");
+    strcat(buf, "Server: Martin Server\r\n");
+    strcat(buf, "Content-Type: text/html\r\n");
+    strcat(buf, "Connection: Close\r\n");
+
+    fileid = fileno(rescourse);
+
+    if (fstat(fileid, &st) == -1)
+    {
+        inner_error(client_sock);//内部出错
+        return -1;
+    }
+
+    snprintf(tmp, 64, "Content_Length: %d\r\n\r\n", st.st_size);
+    strcat(buf, tmp);
+    if (debug) fprintf(stdout, "headers: %s\n", buf);
+
+    if (send(client_sock, buf, strlen(buf), 0) < 0)
+    {
+          fprintf(stderr, "send failed data: %s reason: %s\n", buf, strerror(errno));
+          return -1;
+    }
+    return 0;
+}
+void cat(int client_sock, FILE* rescourse)
+{
+    char buf[1024];
+
+    fgets(buf, sizeof(buf), rescourse);
+    
+    while (!feof(rescourse))
+    {
+        int len = write(client_sock, buf, strlen(buf));
+
+        if (len < 0)//发送body的过程中出现问题
+        {
+            fprintf(stderr, "send body error, reason: %s\n", strerror(errno));
+            break;
+        }
+
+        if (debug) fprintf(stdout, "%s", buf);
+        fgets(buf, sizeof(buf), rescourse);
+
+    }
+
+}
+
+void  do_http_response1(int client_sock)
+{
+    const char* main_header = "HTTP/1.0 200 OK\r\nServer: Martin Server\r\nContent-Type: text/html\r\nConnection: Close\r\n";
+    const char* welcome_content = "\
+<html lang=\"zh-CN\">\n\
+<head>\n\
+<meta content=\"text/html; charset=utf-8\" http-equiv=\"Content-Type\">\n\
+<title>This is a test</title>\n\
+</head>\n\
+<body>\n\
+<div align=center height=\"500px\" >\n\
+<br/><br/><br/>\n\
+<h2>大家好，欢迎来到奇牛学院VIP 试听课！</h2><br/><br/>\n\
+<form action=\"commit\" method=\"post\">\n\
+尊姓大名: <input type=\"text\" name=\"name\" />\n\
+<br/>芳龄几何: <input type=\"password\" name=\"age\" />\n\
+<br/><br/><br/><input type=\"submit\" value=\"提交\" />\n\
+<input type=\"reset\" value=\"重置\" />\n\
+</form>\n\
+</div>\n\
+</body>\n\
+</html>\n";
+
+//1、发送main_header
+    int len = write(client_sock, main_header, strlen(main_header));
+
+    if (debug) fprintf(stdout, "... do_http_response...\n");
+    if (debug) fprintf(stdout, "write[%d]: %s", len, main_header);
+//2、生成Content-Length
+
+    char send_buf[64];
+    int wc_len = strlen(welcome_content);
+    len = snprintf(send_buf, 64, "Content_Length: %d\r\n\r\n", wc_len);
+    len = write(client_sock, send_buf, len);
+
+    if (debug) fprintf(stdout, "write[%d]: %s", len, send_buf);
+
+//3、发送html，文件内容
+
+    len = write(client_sock, welcome_content, wc_len);
+    if (debug) fprintf(stdout, "write[%d]: %s", len,welcome_content);
+
+}
+
+//返回值：-1，表示读取出错，等于0表示读到一个空行，大于0表示成功读取一行
+int get_line(int socket, char* buf, int size)
+{
+    int count = 0;
+    char ch = '\0';
+    int len = 0;
+
+    while ((count < size - 1) && ch != '\n')
+    {
+        len = read(socket, &ch, 1);
+        if (len == 1)
+        {
+            if (ch == '\r')
+            {
+                continue;
+            }
+            else if (ch == '\n')
+            {
+                // buf[count]= '\0';
+                break;
+            }
+
+            //处理正常的字符
+            buf[count] = ch;
+            count++;
+        }
+        else if (len == -1)//读取出错
+        {
+            perror("read failed");
+            count = -1;
+            break;
+        }
+        else//read返回0，客户端关闭sock链接
+        {
+            fprintf(stderr, "client close.\n");
+            break;
+        }
+    }
+    if (count >= 0)  buf[count] = '\0';
+    return count;
+}
+
+
+void not_found(int client_sock)
+{
+    const char* reply = "HTTP/1.0 404 NOT FOUND\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<HTML lang=\"zh-CN\">\r\n\
+<meta content=\"text/html; charset=utf-8\" http-equiv=\"Content-Type\">\r\n\
+<HEAD>\r\n\
+<TITLE>NOT FOUND</TITLE>\r\n\
+</HEAD>\r\n\
+<BODY>\r\n\
+	<P>文件不存在！\r\n\
+    <P>The server could not fulfill your request because the resource specified is unavailable or nonexistent.\r\n\
+</BODY>\r\n\
+</HTML>";
+
+    int len = write(client_sock, reply, strlen(reply));
+    if (debug) fprintf(stdout, reply);
+
+    if (len <= 0)
+    {
+        fprintf(stderr, "send reply failed reason: %s\n", strerror(errno));
+    }
+}
+
+void unimplemented(int client_sock)
+{
+    const char* reply = "HTTP/1.0 501 Method Not Implemented\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<HTML>\r\n\
+<HEAD>\r\n\
+<TITLE>Method Not Implemented</TITLE>\r\n\
+</HEAD>\r\n\
+<BODY>\r\n\
+    <P>HTTP request method not supported.\r\n\
+</BODY>\r\n\
+</HTML>";
+
+    int len = write(client_sock, reply, strlen(reply));
+    if (debug) fprintf(stdout, reply);
+
+    if (len <= 0)
+    {
+        fprintf(stderr, "send reply failed reason: %s\n", strerror(errno));
+    }
+}
+
+void bad_request(int client_sock)
+{
+    const char* reply = "HTTP/1.0 400 BAD REQUEST\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<HTML>\r\n\
+<HEAD>\r\n\
+<TITLE>BAD REQUEST</TITLE>\r\n\
+</HEAD>\r\n\
+<BODY>\r\n\
+    <P>Your browser sent a bad request！\r\n\
+</BODY>\r\n\
+</HTML>";
+
+    int len = write(client_sock, reply, strlen(reply));
+
+    if (len <= 0)
+    {
+        fprintf(stderr, "send reply failed reason: %s\n", strerror(errno));
+    }
+}
+
+void inner_error(int client_sock)
+{
+    const char* reply = "HTTP/1.0 500 Internal Sever Error\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<HTML lang=\"zh-CN\">\r\n\
+<meta content=\"text/html; charset=utf-8\" http-equiv=\"Content-Type\">\r\n\
+<HTML>\r\n\
+<HEAD>\r\n\
+<TITLE>Inner Error</TITLE>\r\n\
+</HEAD>\r\n\
+<BODY>\r\n\
+	<P>服务器内部出错！\r\n\
+</BODY>\r\n\
+</HTML>";
+
+    int len = write(client_sock, reply, strlen(reply));
+    if (debug) fprintf(stdout, reply);
+
+    if (len <= 0)
+    {
+        fprintf(stderr, "send reply failed reason: %s\n", strerror(errno));
+    }
+}
